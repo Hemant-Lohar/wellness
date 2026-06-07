@@ -1,0 +1,7 @@
+{
+    "rewrites": [
+      { "source": "/api/search", "destination": "/api/search" },
+      { "source": "/api/cart",   "destination": "/api/cart"   },
+      { "source": "/(.*)",       "destination": "/index.html" }
+    ]
+  }
