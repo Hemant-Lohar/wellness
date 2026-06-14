@@ -4,22 +4,19 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: true,   // ← add this
     proxy: {
-      '/api/search': {
-        target: 'https://api.1mg.com',
+      // 1mg search & autocomplete
+      '/pwa-dweb-api': {
+        target: 'https://www.1mg.com',
         changeOrigin: true,
-        rewrite: (path) => path.replace('/api/search', '/api/v4/search/autocomplete'),
+        secure: true,
       },
-      '/api/cart': {
-        target: 'https://api.thewellnesscorner.com',
+      
+      // Wellness Corner cart (api.thewellnesscorner.com)
+      '/api': {
+        target: 'https://wellness-liard-nine.vercel.app',  // ← your Vercel deployment
         changeOrigin: true,
-        rewrite: (path) => path.replace('/api/cart', '/store/tata-1mg/cart'),
-      },
-      '/img': {
-        target: 'https://onemg.gumlet.io',
-        changeOrigin: true,
-        rewrite: (path) => path.replace('/img', ''),
+        secure: true,
       },
     },
   },

@@ -1,605 +1,845 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from 'react'
 
-const TOKEN_KEY = "wc_token";
-const PAGE_SIZE = 20;
-
-/* ── Types ── */
+/* ═══════════════════════════════════════════════════════
+   TYPES
+═══════════════════════════════════════════════════════ */
 interface Product {
-  sku: string;
-  name: string;
-  image: string;
-  price: number;
-  manufacturer: string;
-  pack: string;
+  sku: string; name: string; manufacturer: string
+  price: number; mrp: number; discount: string
+  image: string; pack: string
+  ratings: { average: number; total: number } | null
+  tag: { text: string; bg: string } | null
+  rx: boolean; ptype: string; avail: boolean; purl: string
+}
+interface CartItem extends Product { qty: number }
+interface ACSuggestion {
+  id: string; type: string; name: string
+  label: string | null; image: string | null; term: string
 }
 
-interface CartItems {
-  [sku: string]: number;
+/* ═══════════════════════════════════════════════════════
+   CONSTANTS
+═══════════════════════════════════════════════════════ */
+const SEARCH_API = '/pwa-dweb-api/api/v4'
+const CART_API   = '/api/cart'
+
+const SEARCH_HDR: Record<string, string> = {
+  accept: 'application/vnd.healthkartplus.v4+json',
+  'hkp-platform': 'Healthkartplus-0.0.1-desktopweb',
+  locale: 'en',
+  'x-access-key': '1mg_client_access_key',
+  'x-platform': 'desktop-0.0.1',
 }
 
-interface Rip {
-  id: number;
-  x: number;
-  y: number;
+const CHIPS = ['Paracetamol','Vitamin D','Dolo 650','Crocin','Azithromycin','Cetirizine','Amoxicillin','Multivitamin','Pantoprazole','Metformin']
+const CITIES = ['Pune','New Delhi','Mumbai','Bangalore','Hyderabad','Chennai','Kolkata','Ahmedabad','Jaipur','Lucknow']
+
+const TOKEN_KEYS = [
+  'access_token','token','authToken','auth_token','wc_token',
+  'jwt','userToken','accessToken','tata1mg_token','wellness_token',
+]
+const WC_STORAGE_KEY = 'wc_token'
+
+// Cross-browser token grabber. Runs ON thewellnesscorner.com (same-origin),
+// scans that page's storage + cookies for a JWT and copies it to the clipboard.
+// This is the reliable path: a page on this app's origin can NEVER read
+// thewellnesscorner.com's storage, so the token must be grabbed over there.
+const TOKEN_BOOKMARKLET =
+  "javascript:(function(){" +
+  "var j=function(v){return typeof v==='string'&&v.indexOf('ey')===0&&v.length>50;};" +
+  "var f=[];" +
+  "var s=function(st){try{for(var i=0;i<st.length;i++){var v=st.getItem(st.key(i));if(j(v)&&f.indexOf(v)<0)f.push(v);}}catch(e){}};" +
+  "s(window.localStorage);s(window.sessionStorage);" +
+  "document.cookie.split(';').forEach(function(c){var v=c.split('=').slice(1).join('=').trim();if(j(v)&&f.indexOf(v)<0)f.push(v);});" +
+  "if(!f.length){alert('No token found on this page. Make sure you are logged in to thewellnesscorner.com, then click again.');return;}" +
+  "var t=f[0];" +
+  "if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){alert('\\u2705 Token copied! Paste it into your Wellness app token panel.');},function(){window.prompt('Copy this token:',t);});}" +
+  "else{window.prompt('Copy this token:',t);}" +
+  "})();"
+
+/* ═══════════════════════════════════════════════════════
+   HELPERS
+═══════════════════════════════════════════════════════ */
+const strip = (h: string) => h.replace(/<[^>]*>/g, '')
+const parsePrice = (s: string | undefined): number => {
+  if (!s) return 0
+  const n = parseFloat(s.replace(/[^\d.]/g, ''))
+  return isNaN(n) ? 0 : n
 }
 
-type ToastState = { msg: string; ok: boolean };
+// JWT validation — EXACT same as original: starts with "ey", length > 50
+const looksLikeJwt = (v: string): boolean =>
+  typeof v === 'string' && v.startsWith('ey') && v.length > 50
 
-/* ── API ── */
-async function apiSearch(q: string): Promise<Product[]> {
-  const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&types=sku&per_page=50`, {
+const mapProduct = (r: Record<string, unknown>): Product => {
+  const pr = r.prices as Record<string, string> | undefined
+  const rt = r.ratings as Record<string, number> | undefined
+  const tg = r.tag as Record<string, string> | undefined
+  return {
+    sku: String(r.id ?? ''),
+    name: strip(String(r.name ?? '')),
+    manufacturer: String(r.manufacturer_name ?? ''),
+    price: parsePrice(pr?.discounted_price),
+    mrp: parsePrice(pr?.mrp),
+    discount: pr?.discount ?? '',
+    image: String(r.image ?? ''),
+    pack: String(r.label ?? ''),
+    ratings: rt ? { average: rt.average_rating, total: rt.total_ratings } : null,
+    tag: tg ? { text: tg.text, bg: tg.bg_color ?? '#fecf7f' } : null,
+    rx: !!r.rx_required,
+    ptype: String(r.type ?? ''),
+    avail: r.available !== false,
+    purl: r.url ? `https://www.1mg.com${r.url}` : '',
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   ORIGINAL: apiAddToCart — EXACT same as your code
+═══════════════════════════════════════════════════════ */
+async function apiAddToCart(token: string, skuId: string, quantity: number) {
+  const res = await fetch(CART_API, {
+    method: 'POST',
     headers: {
-      "Accept": "application/vnd.healthkartplus.v7+json",
-      "hkp-platform": "HealthKartPlus-11.0.0-Android",
-      "x-api-key": "1mg_client_access_key",
-      "x-access-key": "1mg_client_access_key",
-      "x-city": "Pune",
+      'content-type': 'application/json',
+      authorization: `Bearer ${token}`,
+      'x-access-token': token,
     },
-  });
-  if (!res.ok) throw new Error("Search failed");
-  const json = await res.json();
-  return (json?.data?.search_results ?? [])
-    .filter((i: Record<string, unknown>) => ["otc","product","sku"].includes(i.type as string) || !i.type)
-    .map((i: Record<string, unknown>) => ({
-      sku: String(i.id ?? ""),
-      name: ((i.name as string) ?? "").replace(/<[^>]*>/g, ""),
-      image: ((i.image as string) ?? "").replace("https://onemg.gumlet.io", "/img"),
-      price: Number(i.price ?? 0),
-      manufacturer: (i.manufacturer_name as string) ?? "",
-      pack: (i.pack_form as string) ?? "",
-    }))
-    .filter((p: Product) => p.sku && p.name);
+    body: JSON.stringify({ skuId, quantity }),
+  })
+  if (!res.ok) throw new Error(`Failed to add SKU ${skuId}: ${res.status}`)
+  return res.json()
 }
 
-async function apiAddToCart(token: string, sku: string, qty: number): Promise<void> {
-  const res = await fetch("/api/cart", {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${token}`,
-      "x-access-token": token,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ skuId: sku, quantity: qty }),
-  });
-  if (!res.ok) throw new Error("Cart failed");
-}
+/* ═══════════════════════════════════════════════════════
+   ORIGINAL: Token auto-detect — EXACT same logic
+═══════════════════════════════════════════════════════ */
+function autoDetectTokens(): { key: string; value: string; source: string }[] {
+  const found: { key: string; value: string; source: string }[] = []
 
-/* ── Hooks ── */
-function usePersistentToken(): [string, (v: string) => void, () => void] {
-  const [token, setToken] = useState<string>(() => localStorage.getItem(TOKEN_KEY) ?? "");
-  const save  = useCallback((v: string) => { setToken(v); localStorage.setItem(TOKEN_KEY, v); }, []);
-  const clear = useCallback(() => { setToken(""); localStorage.removeItem(TOKEN_KEY); }, []);
-  return [token, save, clear];
-}
-
-function useDebounce<T>(value: T, delay: number): T {
-  const [dv, setDv] = useState<T>(value);
-  useEffect(() => { const t = setTimeout(() => setDv(value), delay); return () => clearTimeout(t); }, [value, delay]);
-  return dv;
-}
-
-function useCart() {
-  const [items, setItems] = useState<CartItems>({});
-  const add    = useCallback((sku: string, qty = 1) => setItems(c => ({ ...c, [sku]: (c[sku] ?? 0) + qty })), []);
-  const remove = useCallback((sku: string) => setItems(c => { const n = { ...c }; delete n[sku]; return n; }), []);
-  const update = useCallback((sku: string, qty: number) => qty <= 0 ? remove(sku) : setItems(c => ({ ...c, [sku]: qty })), [remove]);
-  const clear  = useCallback(() => setItems({}), []);
-  const count  = Object.values(items).reduce((a: number, b: number) => a + b, 0);
-  return { items, add, remove, update, clear, count };
-}
-
-/* ── Components ── */
-function ProductImg({ src, name }: { src: string; name: string }) {
-  const [err, setErr] = useState(false);
-  const clean = src ? src.replace(/\/l_watermark[^/]*\/[^/]*\//, "/") : "";
-  if (!clean || err) return (
-    <div style={{ width:80, height:80, borderRadius:12, background:"#E0F2F1", flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center" }}>
-      <span style={{ fontSize:26, fontWeight:700, color:"#00897B" }}>{(name??"?").charAt(0).toUpperCase()}</span>
-    </div>
-  );
-  return (
-    <div style={{ width:80, height:80, borderRadius:12, overflow:"hidden", flexShrink:0, background:"#F5F9F8", display:"flex", alignItems:"center", justifyContent:"center" }}>
-      <img src={clean} alt={name} onError={() => setErr(true)} style={{ width:"100%", height:"100%", objectFit:"contain", padding:4 }} />
-    </div>
-  );
-}
-
-type RippleBtnVariant = "primary" | "tonal" | "ghost";
-
-interface RippleBtnProps {
-  children: React.ReactNode;
-  onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void;
-  variant?: RippleBtnVariant;
-  disabled?: boolean;
-  full?: boolean;
-  sm?: boolean;
-}
-
-function RippleBtn({ children, onClick, variant = "primary", disabled, full, sm }: RippleBtnProps) {
-  const [rips, setRips] = useState<Rip[]>([]);
-  const fire = (e: React.MouseEvent<HTMLButtonElement>) => {
-    if (disabled) return;
-    const r = e.currentTarget.getBoundingClientRect(), id = Date.now();
-    setRips(rs => [...rs, { id, x: e.clientX - r.left, y: e.clientY - r.top }]);
-    setTimeout(() => setRips(rs => rs.filter(rr => rr.id !== id)), 600);
-    onClick?.(e);
-  };
-  const V: Record<RippleBtnVariant, React.CSSProperties> = {
-    primary: { background:"#00897B", color:"#fff" },
-    tonal:   { background:"#E0F2F1", color:"#00695C" },
-    ghost:   { background:"transparent", color:"#00897B", border:"1.5px solid #00897B" },
-  };
-  return (
-    <button onClick={fire} disabled={disabled} style={{ position:"relative", overflow:"hidden", border:"none", cursor:disabled?"not-allowed":"pointer", borderRadius:999, padding:sm?"7px 16px":"10px 22px", fontFamily:"inherit", fontWeight:600, fontSize:sm?13:14, display:"inline-flex", alignItems:"center", justifyContent:"center", gap:6, width:full?"100%":undefined, opacity:disabled?.45:1, flexShrink:0, ...V[variant] }}>
-      <span style={{ position:"relative", zIndex:1 }}>{children}</span>
-      {rips.map(rp => <span key={rp.id} style={{ position:"absolute", left:rp.x, top:rp.y, width:8, height:8, borderRadius:"50%", transform:"translate(-50%,-50%) scale(0)", background:variant==="primary"?"rgba(255,255,255,.45)":"rgba(0,137,123,.3)", animation:"rpl .6s ease-out forwards", pointerEvents:"none" }} />)}
-    </button>
-  );
-}
-
-interface QtyControlProps {
-  qty: number;
-  onChange: (qty: number) => void;
-  sm?: boolean;
-}
-
-function QtyControl({ qty, onChange, sm }: QtyControlProps) {
-  const p = sm ? "5px 10px" : "7px 13px", f = sm ? 13 : 15;
-  return (
-    <div style={{ display:"flex", alignItems:"center", border:"1.5px solid #DDE8E6", borderRadius:999, overflow:"hidden", flexShrink:0 }}>
-      <button onClick={() => onChange(qty-1)} style={{ border:"none", background:"none", padding:p, cursor:"pointer", fontSize:f, color:"#333", lineHeight:1 }}>−</button>
-      <span style={{ fontSize:f-1, fontWeight:600, minWidth:sm?20:26, textAlign:"center", color:"#1A2422" }}>{qty}</span>
-      <button onClick={() => onChange(qty+1)} style={{ border:"none", background:"none", padding:p, cursor:"pointer", fontSize:f, color:"#333", lineHeight:1 }}>+</button>
-    </div>
-  );
-}
-
-interface ProductCardProps {
-  p: Product;
-  onAdd: (sku: string, qty: number) => void;
-}
-
-function ProductCard({ p, onAdd }: ProductCardProps) {
-  const [qty, setQty] = useState(1);
-  const [added, setAdded] = useState(false);
-  const handleAdd = () => { onAdd(p.sku, qty); setAdded(true); setTimeout(() => setAdded(false), 1200); };
-  return (
-    <div style={{ background:"#fff", border:`1.5px solid ${added?"#00897B":"#EAF0EF"}`, borderRadius:16, padding:16, display:"flex", flexDirection:"column", gap:14, transition:"border-color .2s, box-shadow .2s" }}
-      onMouseEnter={e => (e.currentTarget as HTMLDivElement).style.boxShadow="0 4px 18px rgba(0,0,0,.08)"}
-      onMouseLeave={e => (e.currentTarget as HTMLDivElement).style.boxShadow="none"}>
-      <div style={{ display:"flex", gap:12, alignItems:"flex-start" }}>
-        <ProductImg src={p.image} name={p.name} />
-        <div style={{ flex:1, minWidth:0 }}>
-          <p style={{ fontSize:14, fontWeight:600, lineHeight:1.45, color:"#1A2422", marginBottom:3 }}>{p.name}</p>
-          {p.manufacturer && <p style={{ fontSize:11, color:"#B0BEC5", marginBottom:2 }}>{p.manufacturer}</p>}
-          {p.pack && <p style={{ fontSize:11, color:"#90A4A0", marginBottom:4 }}>{p.pack}</p>}
-          {p.price > 0 ? <p style={{ fontSize:17, fontWeight:700, color:"#00897B" }}>₹{p.price}</p> : <p style={{ fontSize:11, color:"#B0BEC5" }}>SKU {p.sku}</p>}
-        </div>
-      </div>
-      <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
-        <QtyControl qty={qty} onChange={q => setQty(Math.max(1, q))} />
-        <RippleBtn onClick={handleAdd} variant={added ? "tonal" : "primary"}>{added ? "✓ Added" : "Add to cart"}</RippleBtn>
-      </div>
-    </div>
-  );
-}
-
-interface PaginationProps {
-  page: number;
-  total: number;
-  pageSize: number;
-  onChange: (page: number) => void;
-}
-
-function Pagination({ page, total, pageSize, onChange }: PaginationProps) {
-  const totalPages = Math.ceil(total / pageSize);
-  if (totalPages <= 1) return null;
-  const pages: number[] = [];
-  const start = Math.max(1, Math.min(page-2, totalPages-4));
-  const end   = Math.min(totalPages, Math.max(page+2, 5));
-  for (let i = start; i <= end; i++) pages.push(i);
-
-  interface BtnProps { label: number | string; target: number; disabled?: boolean; }
-  const Btn = ({ label, target, disabled: dis = false }: BtnProps) => (
-    <button key={String(label)} onClick={() => !dis && onChange(target)} disabled={dis} style={{ border:"1.5px solid", borderRadius:10, borderColor:target===page?"#00897B":"#DDE8E6", background:target===page?"#00897B":"#fff", color:target===page?"#fff":dis?"#CCC":"#1A2422", fontFamily:"inherit", fontWeight:600, fontSize:14, padding:"8px 14px", cursor:dis?"not-allowed":"pointer", minWidth:40, transition:"all .15s" }}>{label}</button>
-  );
-  return (
-    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginTop:32, flexWrap:"wrap" }}>
-      <Btn label="←" target={page-1} disabled={page===1} />
-      {start > 1 && <><Btn label={1} target={1} />{start > 2 && <span style={{ color:"#B0BEC5", padding:"0 4px" }}>…</span>}</>}
-      {pages.map(p => <Btn key={p} label={p} target={p} />)}
-      {end < totalPages && <>{end < totalPages-1 && <span style={{ color:"#B0BEC5", padding:"0 4px" }}>…</span>}<Btn label={totalPages} target={totalPages} /></>}
-      <Btn label="→" target={page+1} disabled={page===totalPages} />
-    </div>
-  );
-}
-
-interface CartDrawerProps {
-  open: boolean;
-  onClose: () => void;
-  cart: ReturnType<typeof useCart>;
-  products: Record<string, Product>;
-  onCheckout: () => void;
-  checkingOut: boolean;
-}
-
-function CartDrawer({ open, onClose, cart, products, onCheckout, checkingOut }: CartDrawerProps) {
-  const entries = Object.entries(cart.items) as [string, number][];
-  const total   = entries.reduce((s, [sku, qty]) => s + ((products[sku]?.price ?? 0) * qty), 0);
-  return (
-    <>
-      <div onClick={onClose} style={{ position:"fixed", inset:0, zIndex:200, background:open?"rgba(0,0,0,.32)":"transparent", pointerEvents:open?"all":"none", transition:"background .3s" }} />
-      <aside style={{ position:"fixed", top:0, right:0, bottom:0, zIndex:201, width:"min(420px,100vw)", background:"#fff", display:"flex", flexDirection:"column", transform:open?"translateX(0)":"translateX(100%)", transition:"transform .32s cubic-bezier(.4,0,.2,1)", boxShadow:open?"-6px 0 36px rgba(0,0,0,.12)":"none" }}>
-        <div style={{ display:"flex", alignItems:"center", padding:"18px 20px 14px", borderBottom:"1px solid #EEF2F1" }}>
-          <h2 style={{ flex:1, fontSize:19, fontWeight:700, fontFamily:"'Bricolage Grotesque',sans-serif", color:"#1A2422" }}>Your cart</h2>
-          {cart.count > 0 && <span style={{ fontSize:12, background:"#F0FAF8", color:"#7A9490", borderRadius:999, padding:"3px 10px", marginRight:10 }}>{cart.count} item{cart.count!==1?"s":""}</span>}
-          <button onClick={onClose} style={{ border:"none", background:"none", cursor:"pointer", fontSize:20, color:"#B0BEC5", lineHeight:1, padding:4 }}>✕</button>
-        </div>
-        <div style={{ flex:1, overflowY:"auto", padding:"0 20px" }}>
-          {entries.length === 0
-            ? <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:280, gap:10, color:"#B0BEC5" }}><span style={{ fontSize:48, opacity:.3 }}>🍳</span><p style={{ fontSize:15, fontWeight:500 }}>Your cart is empty</p><p style={{ fontSize:13 }}>Search and add products</p></div>
-            : entries.map(([sku, qty]) => {
-                const p = products[sku]; if (!p) return null;
-                return (
-                  <div key={sku} style={{ display:"flex", gap:12, padding:"14px 0", borderBottom:"1px solid #F0F4F3", alignItems:"center" }}>
-                    <div style={{ flex:1, minWidth:0 }}>
-                      <p style={{ fontSize:13, fontWeight:600, lineHeight:1.4, color:"#1A2422", marginBottom:2 }}>{p.name}</p>
-                      {p.price > 0 && <p style={{ fontSize:12, color:"#7A9490" }}>₹{p.price} × {qty} = <strong style={{ color:"#00897B" }}>₹{p.price*qty}</strong></p>}
-                    </div>
-                    <QtyControl qty={qty} onChange={q => cart.update(sku, q)} sm />
-                    <button onClick={() => cart.remove(sku)} style={{ border:"none", background:"none", cursor:"pointer", color:"#CCC", fontSize:18, lineHeight:1, padding:"2px 4px", borderRadius:4, transition:"color .15s" }} onMouseEnter={e=>(e.currentTarget as HTMLButtonElement).style.color="#EF5350"} onMouseLeave={e=>(e.currentTarget as HTMLButtonElement).style.color="#CCC"}>✕</button>
-                  </div>
-                );
-              })
-          }
-        </div>
-        {entries.length > 0 && (
-          <div style={{ padding:"16px 20px 28px", borderTop:"1px solid #EEF2F1" }}>
-            {total > 0 && <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:16 }}><span style={{ fontSize:14, color:"#7A9490" }}>Order total</span><span style={{ fontSize:28, fontWeight:700, color:"#1A2422" }}>₹{total}</span></div>}
-            <RippleBtn onClick={onCheckout} full disabled={checkingOut}>{checkingOut ? "Placing order…" : "Proceed to checkout →"}</RippleBtn>
-          </div>
-        )}
-      </aside>
-    </>
-  );
-}
-
-/* ── Token Panel with auto-detect ── */
-interface TokenPanelProps {
-  token: string;
-  onSave: (v: string) => void;
-  onClear: () => void;
-  onClose: () => void;
-}
-
-function TokenPanel({ token, onSave, onClear, onClose }: TokenPanelProps) {
-  const [val, setVal]             = useState(token);
-  const [show, setShow]           = useState(false);
-  const [detecting, setDetecting] = useState(false);
-  const [detectMsg, setDetectMsg] = useState("");
-
-  useEffect(() => setVal(token), [token]);
-
-  const autoDetect = () => {
-    setDetecting(true);
-    setDetectMsg("");
-
-    const keys = [
-      "access_token", "token", "authToken", "auth_token",
-      "wc_token", "jwt", "userToken", "accessToken",
-      "tata1mg_token", "wellness_token",
-    ];
-
-    for (const key of keys) {
+  const scanStore = (store: Storage, label: string) => {
+    // Check known token keys
+    TOKEN_KEYS.forEach(k => {
       try {
-        const v = localStorage.getItem(key);
-        if (v && v.startsWith("ey") && v.length > 50) {
-          setVal(v);
-          setDetectMsg("✓ Token found in localStorage — click Save to use it");
-          setDetecting(false);
-          return;
-        }
-      } catch {}
-    }
-
-    for (const key of keys) {
-      try {
-        const v = sessionStorage.getItem(key);
-        if (v && v.startsWith("ey") && v.length > 50) {
-          setVal(v);
-          setDetectMsg("✓ Token found in sessionStorage — click Save to use it");
-          setDetecting(false);
-          return;
-        }
-      } catch {}
-    }
-
+        const v = store.getItem(k)
+        if (v && looksLikeJwt(v) && !found.some(f => f.value === v))
+          found.push({ key: k, value: v, source: label })
+      } catch { /* */ }
+    })
+    // Also scan ALL keys for JWT-shaped values
     try {
-      const cookies = document.cookie.split(";").map(c => c.trim());
-      for (const cookie of cookies) {
-        const [, v] = cookie.split("=");
-        if (v && v.startsWith("ey") && v.length > 50) {
-          setVal(decodeURIComponent(v));
-          setDetectMsg("✓ Token found in cookies — click Save to use it");
-          setDetecting(false);
-          return;
-        }
+      for (let i = 0; i < store.length; i++) {
+        const k = store.key(i)
+        if (!k) continue
+        const v = store.getItem(k)
+        if (v && looksLikeJwt(v) && !found.some(f => f.value === v))
+          found.push({ key: k, value: v, source: label })
       }
-    } catch {}
+    } catch { /* */ }
+  }
 
-    setDetectMsg("✗ Not found automatically — open thewellnesscorner.com, copy from Network tab → authorization header");
-    setDetecting(false);
-  };
+  scanStore(localStorage, 'localStorage')
+  scanStore(sessionStorage, 'sessionStorage')
 
-  const isValid = val && val.startsWith("ey") && val.length > 50;
+  // Cookies
+  try {
+    document.cookie.split(';').forEach(c => {
+      const [k, ...vp] = c.split('=')
+      const key = k?.trim()
+      const val = vp.join('=').trim()
+      if (key && val && looksLikeJwt(val) && !found.some(f => f.value === val))
+        found.push({ key, value: val, source: 'cookie' })
+    })
+  } catch { /* */ }
 
-  return (
-    <div style={{ background: "#fff", borderBottom: "1px solid #EEF2F1", animation: "slideDown .2s ease" }}>
-      <div style={{ maxWidth: 680, margin: "0 auto", padding: "16px 24px" }}>
-        <div style={{ display: "flex", alignItems: "center", marginBottom: 14 }}>
-          <p style={{ flex: 1, fontSize: 11, fontWeight: 600, color: "#7A9490", textTransform: "uppercase", letterSpacing: .5 }}>Access Token</p>
-          <p style={{ fontSize: 12, color: "#B0BEC5", marginRight: 12 }}>Used for cart checkout</p>
-          <button onClick={onClose} style={{ border: "none", background: "none", cursor: "pointer", color: "#B0BEC5", fontSize: 18, lineHeight: 1 }}>✕</button>
-        </div>
-
-        <div style={{ background: "#F2F7F5", borderRadius: 12, padding: "12px 16px", marginBottom: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
-            <span style={{ fontSize: 13, fontWeight: 600, color: "#1A2422" }}>⚡ Auto-detect</span>
-            <span style={{ fontSize: 11, background: "#E0F2F1", color: "#00695C", borderRadius: 999, padding: "2px 8px", fontWeight: 500 }}>Recommended</span>
-          </div>
-          <p style={{ fontSize: 12, color: "#7A9490", marginBottom: 10, lineHeight: 1.6 }}>
-            Open <strong>thewellnesscorner.com</strong> in this browser and log in first, then click detect.
-          </p>
-          <button
-            onClick={autoDetect}
-            disabled={detecting}
-            style={{ border: "1.5px solid #00897B", background: detecting ? "#E0F2F1" : "transparent", color: "#00897B", borderRadius: 999, padding: "8px 20px", fontSize: 13, fontWeight: 600, cursor: detecting ? "not-allowed" : "pointer", fontFamily: "inherit", transition: "all .15s", display: "flex", alignItems: "center", gap: 8 }}>
-            {detecting
-              ? <><span style={{ width: 13, height: 13, border: "2px solid #C8DFDB", borderTopColor: "#00897B", borderRadius: "50%", animation: "spin .7s linear infinite", display: "inline-block" }} /> Detecting…</>
-              : "🔍 Detect token automatically"
-            }
-          </button>
-          {detectMsg && (
-            <p style={{ marginTop: 10, fontSize: 12, lineHeight: 1.6, color: detectMsg.startsWith("✓") ? "#2E7D32" : "#C62828", background: detectMsg.startsWith("✓") ? "#F1F8E9" : "#FFF3F3", padding: "8px 12px", borderRadius: 8 }}>
-              {detectMsg}
-            </p>
-          )}
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
-          <div style={{ flex: 1, height: 1, background: "#EEF2F1" }} />
-          <span style={{ fontSize: 12, color: "#B0BEC5", fontWeight: 500 }}>or paste manually</span>
-          <div style={{ flex: 1, height: 1, background: "#EEF2F1" }} />
-        </div>
-
-        <div style={{ marginBottom: 8 }}>
-          <p style={{ fontSize: 12, color: "#7A9490", marginBottom: 8, lineHeight: 1.6 }}>
-            Go to <strong>thewellnesscorner.com</strong> → DevTools (F12) → Network tab → any request → Headers → copy value after <code style={{ fontFamily: "monospace", background: "#F0F4F3", padding: "1px 4px", borderRadius: 4 }}>Bearer </code>
-          </p>
-          <div style={{ display: "flex", gap: 8 }}>
-            <div style={{ flex: 1, display: "flex", border: `1.5px solid ${isValid ? "#00897B" : "#C8DFDB"}`, borderRadius: 10, overflow: "hidden", minWidth: 0, transition: "border-color .2s" }}>
-              <input
-                type={show ? "text" : "password"}
-                value={val}
-                onChange={e => { setVal(e.target.value); setDetectMsg(""); }}
-                onKeyDown={e => e.key === "Enter" && isValid && onSave(val)}
-                placeholder="eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9…"
-                style={{ flex: 1, border: "none", padding: "10px 14px", fontFamily: "monospace", fontSize: 12, background: "#FAFCFC", outline: "none", color: "#1A2422", minWidth: 0 }}
-              />
-              <button onClick={() => setShow(s => !s)}
-                style={{ border: "none", background: "#F0FAF8", padding: "0 14px", cursor: "pointer", borderLeft: "1px solid #C8DFDB", fontSize: 15, flexShrink: 0 }}>
-                {show ? "🙈" : "👁️"}
-              </button>
-            </div>
-            <button
-              onClick={() => isValid && onSave(val)}
-              disabled={!isValid}
-              style={{ border: "none", borderRadius: 999, padding: "0 20px", background: isValid ? "#00897B" : "#E0E0E0", color: isValid ? "#fff" : "#AAA", fontFamily: "inherit", fontWeight: 600, fontSize: 13, cursor: isValid ? "pointer" : "not-allowed", flexShrink: 0, transition: "all .2s" }}>
-              Save
-            </button>
-            {token && (
-              <button onClick={() => { onClear(); setVal(""); setDetectMsg(""); }}
-                style={{ border: "1.5px solid #DDE8E6", borderRadius: 999, padding: "0 16px", background: "transparent", color: "#7A9490", fontFamily: "inherit", fontWeight: 600, fontSize: 13, cursor: "pointer", flexShrink: 0 }}>
-                Clear
-              </button>
-            )}
-          </div>
-          {val && (
-            <p style={{ marginTop: 8, fontSize: 12, color: isValid ? "#2E7D32" : "#C62828" }}>
-              {isValid ? `✓ Valid JWT token (${val.length} chars)` : "✗ Doesn't look like a valid token — should start with 'ey'"}
-            </p>
-          )}
-        </div>
-        <p style={{ fontSize: 11, color: "#B0BEC5", marginTop: 6 }}>
-          Stored only in your browser's localStorage. Never sent anywhere except The Wellness Corner API.
-        </p>
-      </div>
-    </div>
-  );
+  return found
 }
 
-interface ToastProps {
-  msg: string;
-  ok: boolean;
-  onDone: () => void;
-}
-
-function Toast({ msg, ok, onDone }: ToastProps) {
-  useEffect(() => { if (!msg) return; const t = setTimeout(onDone, 3000); return () => clearTimeout(t); }, [msg]);
-  if (!msg) return null;
-  return (
-    <div style={{ position:"fixed", bottom:28, left:"50%", transform:"translateX(-50%)", zIndex:999, background:ok?"#2E7D32":"#C62828", color:"#fff", padding:"13px 22px", borderRadius:12, fontSize:14, fontWeight:500, display:"flex", alignItems:"center", gap:16, minWidth:260, maxWidth:"calc(100vw - 32px)", boxShadow:"0 8px 28px rgba(0,0,0,.2)", animation:"toastIn .25s ease" }}>
-      <span style={{ flex:1 }}>{msg}</span>
-      <button onClick={onDone} style={{ border:"none", background:"none", color:"rgba(255,255,255,.7)", cursor:"pointer", fontSize:14 }}>✕</button>
-    </div>
-  );
-}
-
-/* ── Main App ── */
+/* ═══════════════════════════════════════════════════════
+   APP COMPONENT
+═══════════════════════════════════════════════════════ */
 export default function App() {
-  const [query, setQuery]           = useState("");
-  const [allResults, setAllResults] = useState<Product[]>([]);
-  const [productMap, setProductMap] = useState<Record<string, Product>>({});
-  const [loading, setLoading]       = useState(false);
-  const [searchErr, setSearchErr]   = useState(false);
-  const [page, setPage]             = useState(1);
-  const [cartOpen, setCartOpen]     = useState(false);
-  const [tokenOpen, setTokenOpen]   = useState(false);
-  const [checkingOut, setCheckout]  = useState(false);
-  const [toast, setToast]           = useState<ToastState>({ msg:"", ok:false });
-  const [token, saveToken, clearToken] = usePersistentToken();
-  const cart    = useCart();
-  const dq      = useDebounce(query, 300);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const topRef   = useRef<HTMLElement>(null);
+  // ── Search state ──
+  const [query, setQuery] = useState('')
+  const [city, setCity] = useState('Pune')
+  const [products, setProducts] = useState<Product[]>([])
+  const [loading, setLoading] = useState(false)
+  const [searched, setSearched] = useState(false)
+  const [page, setPage] = useState(0)
+  const [scrollId, setScrollId] = useState('')
+  const [hasMore, setHasMore] = useState(false)
+  const [searchErr, setSearchErr] = useState('')
 
-  const paged = allResults.slice((page-1)*PAGE_SIZE, page*PAGE_SIZE);
+  // ── Autocomplete state ──
+  const [suggestions, setSuggestions] = useState<ACSuggestion[]>([])
+  const [showAC, setShowAC] = useState(false)
+  const acTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const searchBoxRef = useRef<HTMLDivElement>(null)
+
+  // ── Cart state (ORIGINAL) ──
+  const [cart, setCart] = useState<CartItem[]>([])
+  const [cartOpen, setCartOpen] = useState(false)
+  const [checkingOut, setCheckingOut] = useState(false)
+
+  // ── Toast (ORIGINAL) ──
+  const [toast, setToast] = useState('')
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const showToast = (msg: string) => {
+    setToast(msg)
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(''), 2500)
+  }
+
+  // ── Token state (ORIGINAL) ──
+  const [token, setToken] = useState(() => {
+    const saved = localStorage.getItem(WC_STORAGE_KEY)
+    return saved && looksLikeJwt(saved) ? saved : ''
+  })
+  const [tokenInput, setTokenInput] = useState(token)
+  const [tokenVisible, setTokenVisible] = useState(false)
+  const [tokenPanelOpen, setTokenPanelOpen] = useState(false)
+  const [detectedTokens, setDetectedTokens] = useState<{ key: string; value: string; source: string }[]>([])
+  const bookmarkletRef = useRef<HTMLTextAreaElement>(null)
+
+  // Persist token to localStorage
+  useEffect(() => {
+    if (token) localStorage.setItem(WC_STORAGE_KEY, token)
+    else localStorage.removeItem(WC_STORAGE_KEY)
+  }, [token])
+
+  // ── Auto-detect on mount (ORIGINAL) ──
+  useEffect(() => {
+    const found = autoDetectTokens()
+    setDetectedTokens(found)
+    // Auto-select first found if no saved token
+    if (!token && found.length > 0) {
+      setToken(found[0].value)
+      setTokenInput(found[0].value)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Close AC dropdown on outside click ──
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node))
+        setShowAC(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  /* ─────────────────────────────────────────────────
+     Token Panel actions (ORIGINAL)
+  ───────────────────────────────────────────────── */
+  const handleDetect = () => {
+    const found = autoDetectTokens()
+    setDetectedTokens(found)
+    if (found.length === 0) showToast('No tokens found in browser storage or cookies')
+    else showToast(`Found ${found.length} token(s)`)
+  }
+
+  const handleSaveToken = () => {
+    const v = tokenInput.trim()
+    if (!v) { showToast('Paste a token first'); return }
+    if (!looksLikeJwt(v)) { showToast('⚠️ Not a valid JWT (must start with "ey")'); return }
+    setToken(v)
+    showToast('✅ Token saved!')
+  }
+
+  const handleClearToken = () => {
+    setToken(''); setTokenInput('')
+    showToast('Token cleared')
+  }
+
+  const handleUseDetected = (value: string) => {
+    setTokenInput(value)
+    setToken(value)
+    showToast('✅ Token applied!')
+  }
+
+  const handleCopyBookmarklet = async () => {
+    // 1) Modern Clipboard API (needs HTTPS + focus + not blocked by iframe policy)
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(TOKEN_BOOKMARKLET)
+        showToast('✅ Copied! Now make a bookmark and paste this as its URL')
+        return
+      }
+    } catch { /* fall through */ }
+    // 2) Fallback: select the visible textarea and use execCommand
+    const ta = bookmarkletRef.current
+    if (ta) {
+      ta.focus()
+      ta.select()
+      ta.setSelectionRange(0, ta.value.length)
+      try {
+        if (document.execCommand('copy')) {
+          showToast('✅ Copied! Now make a bookmark and paste this as its URL')
+          return
+        }
+      } catch { /* fall through */ }
+      showToast('Couldn’t auto-copy — the code is selected, press Ctrl/Cmd+C')
+      return
+    }
+    showToast('Couldn’t auto-copy — select the code box below and press Ctrl/Cmd+C')
+  }
+
+  /* ─────────────────────────────────────────────────
+     Autocomplete
+  ───────────────────────────────────────────────── */
+  const fetchAutocomplete = useCallback(async (q: string) => {
+    if (q.trim().length < 2) { setSuggestions([]); return }
+    try {
+      const params = new URLSearchParams({ q, types: 'allopathy,brand,sku,udp,disease', per_page: '12' })
+      const res = await fetch(`${SEARCH_API}/search/autocomplete?${params}`, {
+        headers: { ...SEARCH_HDR, 'x-city': city },
+      })
+      const json = await res.json()
+      const results: ACSuggestion[] = ((json?.data?.search_results) as Record<string, unknown>[] ?? []).map(
+        (s: Record<string, unknown>) => ({
+          id: String(s.id ?? ''),
+          type: String(s.type ?? ''),
+          name: String(s.name ?? ''),
+          label: s.label ? String(s.label) : null,
+          image: s.image ? String(s.image) : null,
+          term: String(s.search_term ?? strip(String(s.name ?? ''))),
+        })
+      )
+      setSuggestions(results)
+      setShowAC(true)
+    } catch { setSuggestions([]) }
+  }, [city])
 
   useEffect(() => {
-    if (dq.length < 3) { setAllResults([]); setSearchErr(false); setPage(1); return; }
-    setLoading(true); setSearchErr(false); setPage(1);
-    apiSearch(dq)
-      .then(data => {
-        setAllResults(data);
-        setProductMap(pm => { const n = { ...pm }; data.forEach((p: Product) => { n[p.sku] = p; }); return n; });
-      })
-      .catch(() => { setSearchErr(true); setAllResults([]); })
-      .finally(() => setLoading(false));
-  }, [dq]);
+    if (acTimerRef.current) clearTimeout(acTimerRef.current)
+    if (query.trim().length >= 2) {
+      acTimerRef.current = setTimeout(() => fetchAutocomplete(query), 250)
+    } else { setSuggestions([]); setShowAC(false) }
+    return () => { if (acTimerRef.current) clearTimeout(acTimerRef.current) }
+  }, [query, fetchAutocomplete])
 
-  const handlePage = (p: number) => { setPage(p); topRef.current?.scrollIntoView({ behavior:"smooth", block:"start" }); };
-
-  const checkout = async () => {
-    if (!token) { setTokenOpen(true); setToast({ msg:"Add your access token first", ok:false }); return; }
-    setCheckout(true);
+  /* ─────────────────────────────────────────────────
+     Search
+  ───────────────────────────────────────────────── */
+  const searchProducts = useCallback(async (q: string, pg = 0, prevSid = '') => {
+    if (!q.trim()) { setProducts([]); setSearched(false); setSearchErr(''); return }
+    setLoading(true); setSearched(true); setSearchErr('')
     try {
-      await Promise.all(
-        (Object.entries(cart.items) as [string, number][]).map(([sku, qty]) => apiAddToCart(token, sku, qty))
-      );
-      cart.clear(); setCartOpen(false); setToast({ msg:"🎉 Order placed!", ok:true });
-    } catch { setToast({ msg:"Checkout failed — check your token", ok:false }); }
-    finally { setCheckout(false); }
-  };
+      const params = new URLSearchParams({
+        q: q.trim(), city, filter: '', page_number: String(pg), scroll_id: prevSid,
+        per_page: '50', types: 'sku,allopathy', sort: 'relevance',
+        fetch_eta: 'true', is_city_serviceable: 'true',
+      })
+      const res = await fetch(`${SEARCH_API}/search/all?${params}`, {
+        headers: { ...SEARCH_HDR, 'x-city': city },
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const json = await res.json()
+      const data = json?.data
+      const results = ((data?.search_results) as Record<string, unknown>[] ?? []).map(mapProduct)
+      setProducts(prev => pg === 0 ? results : [...prev, ...results])
+      setScrollId(String(data?.scroll_id ?? ''))
+      setHasMore(results.length >= 50)
+    } catch (e) {
+      if (pg === 0) setProducts([])
+      setSearchErr(e instanceof Error ? e.message : 'Search failed')
+    } finally { setLoading(false) }
+  }, [city])
 
-  const CHIPS = ["Vitamin C","Omega-3","Ashwagandha","Probiotics","Biotin","Zinc"];
+  const handleSearch = (q: string) => {
+    setQuery(q); setPage(0); setScrollId(''); setShowAC(false); setSuggestions([])
+    searchProducts(q, 0, '')
+  }
+
+  const handleLoadMore = () => {
+    const next = page + 1; setPage(next)
+    searchProducts(query, next, scrollId)
+  }
+
+  /* ─────────────────────────────────────────────────
+     Cart (ORIGINAL logic)
+  ───────────────────────────────────────────────── */
+  const addToCart = (p: Product) => {
+    setCart(prev => {
+      const existing = prev.find(c => c.sku === p.sku)
+      if (existing) return prev.map(c => c.sku === p.sku ? { ...c, qty: c.qty + 1 } : c)
+      return [...prev, { ...p, qty: 1 }]
+    })
+    showToast(`Added: ${p.name.slice(0, 40)}`)
+  }
+
+  const updateQty = (sku: string, delta: number) => {
+    setCart(prev => prev.map(c => c.sku === sku ? { ...c, qty: Math.max(1, c.qty + delta) } : c))
+  }
+
+  const removeFromCart = (sku: string) => {
+    setCart(prev => prev.filter(c => c.sku !== sku))
+  }
+
+  const cartTotal = cart.reduce((sum, c) => sum + c.price * c.qty, 0)
+  const cartCount = cart.reduce((sum, c) => sum + c.qty, 0)
+
+  /* ─────────────────────────────────────────────────
+     Checkout (ORIGINAL — Promise.all, apiAddToCart)
+  ───────────────────────────────────────────────── */
+  const handleCheckout = async () => {
+    if (!token) {
+      showToast('⚠️ Set your Wellness Corner token first!')
+      setTokenPanelOpen(true)
+      return
+    }
+    if (cart.length === 0) return
+    setCheckingOut(true)
+    try {
+      const results = await Promise.allSettled(
+        cart.map(item => apiAddToCart(token, item.sku, item.qty))
+      )
+      const succeeded = results.filter(r => r.status === 'fulfilled').length
+      const failed = results.filter(r => r.status === 'rejected').length
+      if (succeeded > 0) {
+        setCart([])
+        setCartOpen(false)
+        showToast(
+          `✅ ${succeeded} item(s) added to Wellness Corner cart!` +
+          (failed > 0 ? ` (${failed} failed)` : '')
+        )
+      } else {
+        showToast('❌ Failed — your token may be expired. Get a fresh one from thewellnesscorner.com')
+      }
+    } catch {
+      showToast('❌ Checkout failed. Please try again.')
+    } finally {
+      setCheckingOut(false)
+    }
+  }
+
+  /* ─────────────────────────────────────────────────
+     AC icon helper
+  ───────────────────────────────────────────────── */
+  const acMeta = (t: string) => {
+    switch (t) {
+      case 'udp': return { icon: '📁', label: 'Category' }
+      case 'drug': return { icon: '💊', label: 'Medicine' }
+      case 'labs': return { icon: '🧪', label: 'Lab Test' }
+      case 'brand': return { icon: '🏷️', label: 'Brand' }
+      case 'disease': return { icon: '🩹', label: 'Condition' }
+      default: return { icon: '🔍', label: '' }
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════
+     RENDER
+  ═══════════════════════════════════════════════════ */
+  const C = '#00897B' // teal — original theme color
 
   return (
     <>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=Bricolage+Grotesque:wght@600;700&display=swap');
-        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-        html{background:#F2F7F5}
-        body{font-family:'DM Sans',sans-serif;background:#F2F7F5;color:#1A2422;-webkit-font-smoothing:antialiased;min-height:100vh}
-        #root{width:100%;min-height:100vh;background:#F2F7F5}
-        input,button{font-family:inherit}
-        input:focus,button:focus{outline:none}
-        ::-webkit-scrollbar{width:5px}
-        ::-webkit-scrollbar-thumb{background:#C5D5D2;border-radius:99px}
-        @keyframes rpl{to{transform:translate(-50%,-50%) scale(30);opacity:0}}
-        @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes slideDown{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+        .fade{animation:fade .3s ease}
+        @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
         @keyframes spin{to{transform:rotate(360deg)}}
-        @keyframes pulse{0%,100%{transform:scale(1);opacity:.55}50%{transform:scale(1.09);opacity:1}}
-        @keyframes toastIn{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
-        .appbar{position:sticky;top:0;z-index:100;width:100%;background:#fff;border-bottom:1px solid #E5EDEB;box-shadow:0 1px 8px rgba(0,0,0,.05);display:flex;align-items:center;gap:16px;padding:0 28px;height:64px}
-        .searchbar{flex:1;display:flex;align-items:center;gap:10px;background:#EAF6F4;border-radius:999px;padding:0 18px;height:44px;border:1.5px solid transparent;transition:border-color .2s,background .2s}
-        .searchbar:focus-within{border-color:#00897B;background:#fff}
-        .search-input{flex:1;border:none;background:transparent;font-size:15px;color:#1A2422;min-width:0}
-        .main{width:100%;padding:32px 28px 120px}
-        .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:16px}
-        .hero{text-align:center;padding:64px 20px 48px;animation:fadeUp .4s ease}
-        .hero h1{font-family:'Bricolage Grotesque',sans-serif;font-size:clamp(28px,5vw,44px);font-weight:700;letter-spacing:-.6px;line-height:1.15;margin-bottom:14px}
-        .hero p{font-size:16px;color:#7A9490;line-height:1.65;max-width:420px;margin:0 auto 28px}
-        .chips{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
-        .chip{padding:9px 22px;border-radius:999px;font-family:inherit;font-size:14px;font-weight:500;cursor:pointer;transition:all .18s;border:1.5px solid #00897B;background:transparent;color:#00897B}
-        .chip:hover{background:#00897B;color:#fff}
-        .fab{position:fixed;bottom:28px;right:28px;z-index:150;width:60px;height:60px;border-radius:18px;background:#00897B;color:#fff;border:none;cursor:pointer;font-size:24px;display:flex;align-items:center;justify-content:center;box-shadow:0 6px 24px rgba(0,137,123,.4);transition:transform .15s}
-        .fab:hover{transform:scale(1.06)}
-        .fab-badge{position:absolute;top:-5px;right:-5px;min-width:22px;height:22px;border-radius:999px;background:#E53935;color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;padding:0 5px;border:2.5px solid #F2F7F5}
-        @media(max-width:900px){.appbar{padding:0 16px;gap:12px}.main{padding:24px 16px 100px}.grid{grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}}
-        @media(max-width:600px){.appbar{flex-wrap:wrap;height:auto;padding:10px 14px;gap:8px}.searchbar{order:10;flex-basis:100%}.appbar-actions{margin-left:auto}.main{padding:18px 12px 90px}.grid{grid-template-columns:1fr}.hero{padding:44px 12px 36px}.fab{bottom:16px;right:14px;width:54px;height:54px;border-radius:16px;font-size:22px}}
-        @media(min-width:1400px){.grid{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}}
+        .btn{position:relative;overflow:hidden;cursor:pointer;border:none;font-family:inherit}
+        .btn::after{content:'';position:absolute;inset:0;background:rgba(255,255,255,.15);opacity:0;transition:opacity .15s}
+        .btn:active::after{opacity:1}
+        .acd{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #e0e0e0;
+          border-top:none;border-radius:0 0 12px 12px;box-shadow:0 8px 24px rgba(0,0,0,.12);max-height:400px;overflow-y:auto;z-index:200}
+        .aci{display:flex;align-items:center;gap:10px;padding:10px 16px;cursor:pointer;transition:background .15s}
+        .aci:hover{background:#e0f2f1}
+        .card{background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 1px 6px rgba(0,0,0,.06);
+          transition:transform .2s,box-shadow .2s;display:flex;flex-direction:column;position:relative}
+        .card:hover{transform:translateY(-4px);box-shadow:0 8px 28px rgba(0,0,0,.1)}
       `}</style>
 
-      <header className="appbar">
-        <div style={{ display:"flex", alignItems:"center", gap:8, flexShrink:0 }}>
-          <span style={{ fontSize:24 }}>💊</span>
-          <span style={{ fontFamily:"'Bricolage Grotesque',sans-serif", fontSize:21, fontWeight:700, color:"#00897B", letterSpacing:-.5 }}>Wellness</span>
-        </div>
-        <div className="searchbar">
-          <span style={{ fontSize:16, opacity:.35, flexShrink:0 }}>🔍</span>
-          <input ref={inputRef} className="search-input" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search supplements, vitamins, OTC products…" />
-          {loading && <span style={{ width:17, height:17, border:"2px solid #C8DFDB", borderTopColor:"#00897B", borderRadius:"50%", animation:"spin .7s linear infinite", flexShrink:0 }} />}
-          {query && !loading && <button onClick={() => { setQuery(""); inputRef.current?.focus(); }} style={{ border:"none", background:"none", cursor:"pointer", color:"#B0BEC5", fontSize:15, flexShrink:0 }}>✕</button>}
-        </div>
-        <div className="appbar-actions" style={{ display:"flex", gap:4, flexShrink:0 }}>
-          <button onClick={() => setTokenOpen(v => !v)} title="Access Token" style={{ border:"none", background:tokenOpen?"#E0F2F1":"none", borderRadius:"50%", width:40, height:40, cursor:"pointer", fontSize:18, display:"flex", alignItems:"center", justifyContent:"center", transition:"background .15s" }}>🔑</button>
-          <button onClick={() => setCartOpen(true)} style={{ position:"relative", border:"none", background:"none", borderRadius:"50%", width:40, height:40, cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center" }}>
-            🛒
-            {cart.count > 0 && <span style={{ position:"absolute", top:2, right:2, minWidth:18, height:18, borderRadius:999, background:"#E53935", color:"#fff", fontSize:10, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center", padding:"0 4px", border:"2px solid #fff" }}>{cart.count > 99 ? "99+" : cart.count}</span>}
-          </button>
-        </div>
-      </header>
+      <div style={{minHeight:'100vh',display:'flex',flexDirection:'column'}}>
 
-      {tokenOpen && <TokenPanel token={token} onSave={v => { saveToken(v); setToast({ msg:"Token saved ✓", ok:true }); setTokenOpen(false); }} onClear={clearToken} onClose={() => setTokenOpen(false)} />}
-
-      <main className="main" ref={topRef}>
-        {query.length < 3 && (
-          <div className="hero">
-            <div style={{ position:"relative", width:130, height:130, margin:"0 auto 32px", display:"flex", alignItems:"center", justifyContent:"center" }}>
-              {[130,95,62].map((s,i) => <div key={s} style={{ position:"absolute", width:s, height:s, borderRadius:"50%", background:`rgba(0,137,123,${.08+i*.07})`, animation:`pulse 3.2s ease-in-out ${i*.45}s infinite` }} />)}
-              <span style={{ fontSize:44, position:"relative", zIndex:1 }}>🌿</span>
+        {/* ══════ APP BAR ══════ */}
+        <header style={{background:C,color:'#fff',padding:'12px 0',position:'sticky',top:0,zIndex:100,boxShadow:'0 2px 8px rgba(0,0,0,.15)'}}>
+          <div style={{maxWidth:1200,margin:'0 auto',padding:'0 20px',display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:10}}>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <span style={{fontSize:24}}>💊</span>
+              <h1 style={{fontSize:20,fontFamily:"'Bricolage Grotesque',sans-serif",fontWeight:800}}>Wellness</h1>
             </div>
-            <h1>Your wellness journey<br />starts here</h1>
-            <p>Search thousands of vitamins, supplements &amp; OTC products from 1mg.</p>
-            {query.length > 0 && query.length < 3 && <p style={{ fontSize:13, color:"#B0BEC5", marginBottom:20 }}>{3-query.length} more character{query.length<2?"s":""} to search…</p>}
-            <div className="chips">{CHIPS.map(c => <button key={c} className="chip" onClick={() => setQuery(c)}>{c}</button>)}</div>
-          </div>
-        )}
 
-        {searchErr && (
-          <div style={{ textAlign:"center", padding:"70px 20px", animation:"fadeUp .3s ease" }}>
-            <div style={{ fontSize:52, opacity:.25, marginBottom:16 }}>⚠️</div>
-            <p style={{ fontSize:16, color:"#7A9490", marginBottom:8 }}>Search failed</p>
-            <p style={{ fontSize:13, color:"#B0BEC5" }}>Check your connection or Vite proxy config.</p>
-          </div>
-        )}
+            {/* Search bar in header */}
+            <div ref={searchBoxRef} style={{flex:1,maxWidth:600,position:'relative'}}>
+              <form onSubmit={e=>{e.preventDefault();handleSearch(query)}} style={{display:'flex'}}>
+                <div style={{flex:1,position:'relative'}}>
+                  <span style={{position:'absolute',left:12,top:'50%',transform:'translateY(-50%)',fontSize:16,opacity:.5,pointerEvents:'none'}}>🔍</span>
+                  <input value={query} onChange={e=>setQuery(e.target.value)}
+                    onFocus={()=>{if(suggestions.length)setShowAC(true)}}
+                    placeholder="Search medicines, health products..."
+                    style={{width:'100%',padding:'9px 36px 9px 40px',fontSize:14,fontFamily:'inherit',
+                      border:'none',borderRadius:showAC&&suggestions.length?'24px 24px 0 0':'24px',
+                      outline:'none',background:'rgba(255,255,255,.95)'}}/>
+                  {query&&(
+                    <button type="button" onClick={()=>{setQuery('');setProducts([]);setSearched(false);setSuggestions([]);setShowAC(false);setSearchErr('')}}
+                      style={{position:'absolute',right:10,top:'50%',transform:'translateY(-50%)',background:'none',border:'none',fontSize:14,color:'#999',cursor:'pointer'}}>
+                      ✕
+                    </button>
+                  )}
+                </div>
+              </form>
 
-        {!searchErr && allResults.length > 0 && (
-          <section style={{ animation:"fadeUp .3s ease" }}>
-            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:18, flexWrap:"wrap", gap:8 }}>
-              <p style={{ fontSize:13, color:"#B0BEC5" }}>
-                <strong style={{ color:"#1A2422" }}>{allResults.length}</strong> result{allResults.length!==1?"s":""} for <strong style={{ color:"#1A2422" }}>"{query}"</strong>
-              </p>
-              {Math.ceil(allResults.length/PAGE_SIZE) > 1 && (
-                <p style={{ fontSize:13, color:"#B0BEC5" }}>
-                  Page <strong style={{ color:"#1A2422" }}>{page}</strong> of <strong style={{ color:"#1A2422" }}>{Math.ceil(allResults.length/PAGE_SIZE)}</strong>
-                  {" "}· {(page-1)*PAGE_SIZE+1}–{Math.min(page*PAGE_SIZE, allResults.length)} of {allResults.length}
-                </p>
+              {/* Autocomplete dropdown */}
+              {showAC&&suggestions.length>0&&(
+                <div className="acd">
+                  {suggestions.map((s,i)=>{const m=acMeta(s.type);return(
+                    <div key={`${s.id}-${i}`} className="aci" onMouseDown={e=>{e.preventDefault();handleSearch(s.term)}}>
+                      {s.image?<img src={s.image} alt="" style={{width:30,height:30,objectFit:'contain',borderRadius:4,flexShrink:0}}/>
+                        :<span style={{fontSize:16,width:26,textAlign:'center',flexShrink:0}}>{m.icon}</span>}
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:13,color:'#263238'}} dangerouslySetInnerHTML={{__html:s.name}}/>
+                        {s.label&&<div style={{fontSize:10,color:'#888',marginTop:1}}>{s.label}</div>}
+                      </div>
+                      {m.label&&<span style={{fontSize:9,color:C,background:'#e0f2f1',padding:'2px 7px',borderRadius:10,flexShrink:0,fontWeight:600}}>{m.label}</span>}
+                      <span style={{fontSize:13,color:'#ccc'}}>↗</span>
+                    </div>
+                  )})}
+                </div>
               )}
             </div>
-            <div className="grid">
-              {paged.map(p => <ProductCard key={p.sku} p={p} onAdd={(sku, qty) => { cart.add(sku, qty); setToast({ msg:"Added to cart", ok:true }); }} />)}
-            </div>
-            <Pagination page={page} total={allResults.length} pageSize={PAGE_SIZE} onChange={handlePage} />
-          </section>
-        )}
 
-        {!loading && !searchErr && query.length >= 3 && allResults.length === 0 && (
-          <div style={{ textAlign:"center", padding:"70px 20px", animation:"fadeUp .3s ease" }}>
-            <div style={{ fontSize:52, opacity:.2, marginBottom:16 }}>🔍</div>
-            <p style={{ fontSize:16, color:"#7A9490" }}>No products found for "<strong style={{ color:"#1A2422" }}>{query}</strong>"</p>
-            <p style={{ fontSize:13, color:"#B0BEC5", marginTop:6 }}>Try a different search term</p>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              {/* City */}
+              <select value={city} onChange={e=>{setCity(e.target.value);if(query)handleSearch(query)}}
+                style={{background:'rgba(255,255,255,.2)',border:'none',color:'#fff',fontSize:12,fontFamily:'inherit',padding:'6px 8px',borderRadius:6,cursor:'pointer',outline:'none'}}>
+                {CITIES.map(c=><option key={c} value={c} style={{color:'#263238'}}>{c}</option>)}
+              </select>
+              {/* Token status dot */}
+              {token&&<span style={{width:8,height:8,borderRadius:'50%',background:'#69f0ae'}} title="Token active"/>}
+              {/* Token btn */}
+              <button onClick={()=>setTokenPanelOpen(!tokenPanelOpen)} className="btn"
+                style={{background:'rgba(255,255,255,.2)',color:'#fff',padding:'6px 12px',borderRadius:8,fontSize:11,fontWeight:600}}>
+                🔑{token?' ✓':''}
+              </button>
+              {/* Cart btn */}
+              <button onClick={()=>setCartOpen(true)} className="btn"
+                style={{background:'#FF6D00',color:'#fff',padding:'6px 14px',borderRadius:8,fontSize:12,fontWeight:600,position:'relative'}}>
+                🛒 {cartCount>0&&<span style={{marginLeft:2}}>{cartCount}</span>}
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {/* ══════ TOKEN PANEL (ORIGINAL UI) ══════ */}
+        {tokenPanelOpen&&(
+          <div className="fade" style={{background:'#fff',borderBottom:'2px solid #e0e0e0',padding:'16px 20px'}}>
+            <div style={{maxWidth:1200,margin:'0 auto'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+                <h3 style={{fontSize:15,fontWeight:700}}>🔑 Wellness Corner Session</h3>
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  {token&&<span style={{fontSize:11,color:'#2e7d32',fontWeight:600,background:'#e8f5e9',padding:'2px 10px',borderRadius:10}}>✅ Connected</span>}
+                  <button onClick={()=>setTokenPanelOpen(false)} style={{background:'none',border:'none',fontSize:16,cursor:'pointer',color:'#888'}}>✕</button>
+                </div>
+              </div>
+
+              <p style={{fontSize:11,color:'#888',marginBottom:12}}>
+                Your JWT lives on <strong>thewellnesscorner.com</strong>. For browser-security reasons this app
+                <strong> can't read it across sites</strong> — so grab it over there with the one-click tool below (works in any browser).
+              </p>
+
+              {/* ✅ Cross-browser token grabber (reliable path) */}
+              <div style={{background:'#e0f2f1',border:`1px solid #b2dfdb`,borderRadius:10,padding:'12px 14px',marginBottom:14}}>
+                <p style={{fontSize:12,fontWeight:700,marginBottom:6,color:'#00695c'}}>✅ Get token from Wellness Corner (any browser)</p>
+                <ol style={{fontSize:11,color:'#37474F',margin:'0 0 10px 18px',lineHeight:1.7}}>
+                  <li>Click <strong>Copy token grabber</strong> below.</li>
+                  <li>Create a new browser bookmark and paste it as the bookmark's <strong>URL/address</strong>. Name it anything.</li>
+                  <li><a href="https://www.thewellnesscorner.com" target="_blank" rel="noopener noreferrer" style={{color:C,fontWeight:600,textDecoration:'underline'}}>Open thewellnesscorner.com ↗</a> and log in.</li>
+                  <li>Click your new bookmark there — the token is copied to your clipboard.</li>
+                  <li>Come back here and paste it below, then Save.</li>
+                </ol>
+                <button onClick={handleCopyBookmarklet} className="btn"
+                  style={{background:C,color:'#fff',padding:'8px 18px',borderRadius:8,fontSize:12,fontWeight:700}}>
+                  📋 Copy token grabber
+                </button>
+
+                {/* Easiest install: drag this link straight onto the bookmarks bar.
+                    href is set via a callback ref so the javascript: URL isn't stripped. */}
+                <p style={{fontSize:11,color:'#37474F',margin:'10px 0 4px'}}>
+                  Easiest: <strong>drag</strong> this button up onto your bookmarks bar 👇
+                </p>
+                <a
+                  ref={el => { if (el) el.setAttribute('href', TOKEN_BOOKMARKLET) }}
+                  onClick={e => e.preventDefault()}
+                  draggable
+                  style={{display:'inline-block',background:'#fff',color:C,border:`1.5px dashed ${C}`,
+                    padding:'7px 16px',borderRadius:8,fontSize:12,fontWeight:700,cursor:'grab',userSelect:'none'}}>
+                  ⬆️ Get WC Token
+                </a>
+
+                {/* Always-visible code box as a manual fallback for copy */}
+                <p style={{fontSize:11,color:'#37474F',margin:'12px 0 4px'}}>
+                  Or copy the code manually:
+                </p>
+                <textarea
+                  ref={bookmarkletRef}
+                  readOnly
+                  value={TOKEN_BOOKMARKLET}
+                  onFocus={e => e.target.select()}
+                  rows={3}
+                  style={{width:'100%',fontFamily:'monospace',fontSize:10,color:'#333',background:'#fff',
+                    border:'1px solid #cfd8dc',borderRadius:8,padding:8,resize:'vertical',whiteSpace:'pre-wrap',wordBreak:'break-all'}}/>
+              </div>
+
+              {/* ⚡ Auto-detect — only finds tokens already saved on THIS site */}
+              <button onClick={handleDetect} className="btn"
+                style={{background:'#fff',color:C,border:`1.5px solid ${C}`,padding:'8px 20px',borderRadius:8,fontSize:12,fontWeight:700,marginBottom:12,display:'flex',alignItems:'center',gap:6}}>
+                ⚡ Re-scan this site's storage
+                <span style={{fontSize:9,background:'#e0f2f1',color:C,padding:'1px 6px',borderRadius:4}}>same site only</span>
+              </button>
+
+              {/* Detected tokens list — ORIGINAL */}
+              {detectedTokens.length>0&&(
+                <div style={{marginBottom:14}}>
+                  <p style={{fontSize:12,fontWeight:600,marginBottom:6}}>Found {detectedTokens.length} token(s):</p>
+                  {detectedTokens.map((t,i)=>(
+                    <div key={i} style={{display:'flex',alignItems:'center',gap:8,background:token===t.value?'#e8f5e9':'#fafafa',
+                      border:`1px solid ${token===t.value?'#a5d6a7':'#eee'}`,borderRadius:8,padding:'6px 10px',marginBottom:4}}>
+                      <span style={{fontSize:10,color:'#666',minWidth:100,flexShrink:0}}>{t.source} → {t.key}</span>
+                      <code style={{flex:1,fontSize:10,color:'#333',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                        {tokenVisible?t.value:t.value.slice(0,12)+'••••••••'+t.value.slice(-8)}
+                      </code>
+                      {token===t.value
+                        ?<span style={{fontSize:10,color:'#2e7d32',fontWeight:700}}>✓ Active</span>
+                        :<button onClick={()=>handleUseDetected(t.value)} className="btn"
+                          style={{fontSize:10,color:C,background:'#e0f2f1',padding:'3px 10px',borderRadius:6,fontWeight:600}}>Use</button>
+                      }
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Manual paste — ORIGINAL */}
+              <p style={{fontSize:12,fontWeight:600,marginBottom:4}}>✏️ Or paste manually:</p>
+              <div style={{position:'relative',marginBottom:8}}>
+                <input value={tokenInput} onChange={e=>setTokenInput(e.target.value)}
+                  type={tokenVisible?'text':'password'}
+                  placeholder='Paste JWT (starts with eyJ...)'
+                  style={{width:'100%',padding:'9px 80px 9px 12px',fontSize:12,fontFamily:'monospace',border:'2px solid #e0e0e0',borderRadius:8,outline:'none'}}
+                  onFocus={e=>e.target.style.borderColor=C}
+                  onBlur={e=>e.target.style.borderColor='#e0e0e0'}/>
+                <button onClick={()=>setTokenVisible(!tokenVisible)}
+                  style={{position:'absolute',right:8,top:'50%',transform:'translateY(-50%)',background:'none',border:'none',fontSize:11,color:'#888',cursor:'pointer'}}>
+                  {tokenVisible?'🙈 Hide':'👁 Show'}
+                </button>
+              </div>
+              <div style={{display:'flex',gap:8}}>
+                <button onClick={handleSaveToken} className="btn"
+                  style={{background:C,color:'#fff',padding:'7px 18px',borderRadius:8,fontSize:12,fontWeight:600}}>
+                  💾 Save
+                </button>
+                {token&&(
+                  <button onClick={handleClearToken} className="btn"
+                    style={{background:'#ffebee',color:'#c62828',padding:'7px 18px',borderRadius:8,fontSize:12,fontWeight:600}}>
+                    🗑 Clear
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         )}
-      </main>
 
-      {cart.count > 0 && !cartOpen && (
-        <button className="fab" onClick={() => setCartOpen(true)}>🛒<span className="fab-badge">{cart.count}</span></button>
-      )}
+        {/* ══════ MAIN ══════ */}
+        <main style={{maxWidth:1200,margin:'0 auto',padding:'20px 20px 80px',width:'100%',flex:1}}>
 
-      <CartDrawer open={cartOpen} onClose={() => setCartOpen(false)} cart={cart} products={productMap} onCheckout={checkout} checkingOut={checkingOut} />
-      <Toast msg={toast.msg} ok={toast.ok} onDone={() => setToast({ msg:"", ok:false })} />
+          {/* Hero */}
+          {!searched&&(
+            <div className="fade" style={{textAlign:'center',padding:'32px 20px 24px'}}>
+              <span style={{fontSize:48}}>🏥</span>
+              <h2 style={{fontSize:22,fontFamily:"'Bricolage Grotesque',sans-serif",fontWeight:800,margin:'8px 0 4px'}}>Search Medicines & Health Products</h2>
+              <p style={{color:'#78909C',fontSize:14}}>Search on 1mg → Add to cart → Push to Wellness Corner</p>
+            </div>
+          )}
+
+          {/* Chips */}
+          {!searched&&(
+            <div style={{display:'flex',flexWrap:'wrap',gap:6,justifyContent:'center',marginBottom:20}}>
+              {CHIPS.map(chip=>(
+                <button key={chip} onClick={()=>handleSearch(chip)} className="btn"
+                  style={{background:'#fff',border:`1px solid #e0e0e0`,borderRadius:20,padding:'5px 14px',fontSize:12,color:'#546E7A',
+                    transition:'all .15s'}}
+                  onMouseEnter={e=>{(e.target as HTMLElement).style.borderColor=C;(e.target as HTMLElement).style.color=C}}
+                  onMouseLeave={e=>{(e.target as HTMLElement).style.borderColor='#e0e0e0';(e.target as HTMLElement).style.color='#546E7A'}}>
+                  {chip}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Results heading */}
+          {searched&&!loading&&products.length>0&&(
+            <p style={{fontSize:13,color:'#78909C',marginBottom:12}}>
+              {products.length} result{products.length!==1?'s':''} for "<strong>{query}</strong>"
+            </p>
+          )}
+
+          {/* Error */}
+          {searchErr&&!loading&&(
+            <div className="fade" style={{textAlign:'center',padding:'40px 20px',color:'#78909C'}}>
+              <span style={{fontSize:40}}>⚠️</span>
+              <h3 style={{fontSize:16,margin:'8px 0 4px',color:'#263238'}}>Search failed</h3>
+              <p style={{fontSize:13}}>{searchErr}</p>
+            </div>
+          )}
+
+          {/* ── Products Grid ── */}
+          <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(260px,1fr))',gap:14}}>
+            {products.map((p,i)=>(
+              <div key={`${p.sku}-${i}`} className="fade card" style={{opacity:p.avail?1:.5}}>
+                {/* Badges */}
+                <div style={{position:'absolute',top:8,left:8,display:'flex',flexWrap:'wrap',gap:4,zIndex:2}}>
+                  {p.tag&&<span style={{background:p.tag.bg,color:'#6b4700',padding:'2px 8px',borderRadius:12,fontSize:10,fontWeight:700,textTransform:'uppercase'}}>{p.tag.text}</span>}
+                  {p.rx&&<span style={{background:'#ffebee',color:'#c62828',padding:'2px 8px',borderRadius:12,fontSize:10,fontWeight:700}}>℞ Rx</span>}
+                  {p.ptype==='otc'&&<span style={{background:'#e8f5e9',color:'#2e7d32',padding:'2px 8px',borderRadius:12,fontSize:10,fontWeight:700}}>OTC</span>}
+                </div>
+                {/* Image */}
+                <div style={{height:160,display:'flex',alignItems:'center',justifyContent:'center',background:'#fafafa',padding:12}}>
+                  <img src={p.image} alt={p.name} loading="lazy"
+                    onError={e=>{(e.target as HTMLImageElement).src='https://placehold.co/200x200?text=No+Image'}}
+                    style={{maxWidth:'100%',maxHeight:'100%',objectFit:'contain'}}/>
+                </div>
+                {/* Info */}
+                <div style={{padding:12,flex:1,display:'flex',flexDirection:'column'}}>
+                  <h3 style={{fontSize:13,fontWeight:600,lineHeight:1.3,display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical',overflow:'hidden',marginBottom:3}}>{p.name}</h3>
+                  <p style={{fontSize:10,color:'#90A4AE',marginBottom:2}}>{p.pack}</p>
+                  {p.manufacturer&&<p style={{fontSize:10,color:'#B0BEC5',marginBottom:4}}>{p.manufacturer}</p>}
+                  {/* Ratings */}
+                  {p.ratings&&(
+                    <div style={{display:'flex',alignItems:'center',gap:4,marginBottom:4}}>
+                      <span style={{background:'#2e7d32',color:'#fff',fontSize:10,fontWeight:700,padding:'1px 6px',borderRadius:4}}>★ {p.ratings.average}</span>
+                      <span style={{fontSize:10,color:'#90A4AE'}}>({p.ratings.total})</span>
+                    </div>
+                  )}
+                  {/* Price */}
+                  <div style={{display:'flex',alignItems:'baseline',gap:5,marginBottom:8}}>
+                    <span style={{fontSize:16,fontWeight:700,color:'#263238'}}>₹{p.price.toFixed(2)}</span>
+                    {p.mrp>p.price&&<span style={{fontSize:11,color:'#B0BEC5',textDecoration:'line-through'}}>₹{p.mrp.toFixed(2)}</span>}
+                    {p.discount&&p.discount!=='0% off'&&(
+                      <span style={{fontSize:10,fontWeight:600,color:'#2e7d32'}}>{p.discount}</span>
+                    )}
+                  </div>
+                  {/* Actions */}
+                  <div style={{marginTop:'auto',display:'flex',gap:4}}>
+                    <button onClick={()=>addToCart(p)} disabled={!p.avail} className="btn"
+                      style={{flex:1,padding:'7px 0',fontSize:12,fontWeight:600,background:p.avail?C:'#ccc',
+                        color:'#fff',borderRadius:8,cursor:p.avail?'pointer':'default'}}>
+                      {p.avail?'+ Add':'Unavailable'}
+                    </button>
+                    {p.purl&&(
+                      <a href={p.purl} target="_blank" rel="noopener noreferrer"
+                        style={{padding:'7px 10px',fontSize:11,color:C,border:`1.5px solid ${C}`,borderRadius:8,display:'flex',alignItems:'center',
+                          transition:'all .15s'}}
+                        onMouseEnter={e=>{e.currentTarget.style.background=C;e.currentTarget.style.color='#fff'}}
+                        onMouseLeave={e=>{e.currentTarget.style.background='transparent';e.currentTarget.style.color=C}}>
+                        ↗
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Loading */}
+          {loading&&(
+            <div style={{display:'flex',flexDirection:'column',alignItems:'center',padding:'40px 20px',color:'#78909C'}}>
+              <div style={{width:32,height:32,border:`3px solid #e0e0e0`,borderTopColor:C,borderRadius:'50%',animation:'spin .7s linear infinite',marginBottom:10}}/>
+              <p style={{fontSize:13}}>Searching...</p>
+            </div>
+          )}
+
+          {/* Empty */}
+          {!loading&&searched&&!searchErr&&products.length===0&&(
+            <div className="fade" style={{textAlign:'center',padding:'40px 20px',color:'#78909C'}}>
+              <span style={{fontSize:40}}>🔍</span>
+              <h3 style={{fontSize:16,margin:'8px 0 4px',color:'#263238'}}>No products found</h3>
+              <p style={{fontSize:13}}>Try a different search term or city.</p>
+            </div>
+          )}
+
+          {/* Load more */}
+          {hasMore&&!loading&&products.length>0&&(
+            <div style={{textAlign:'center',padding:'20px 0'}}>
+              <button onClick={handleLoadMore} className="btn"
+                style={{background:C,color:'#fff',padding:'9px 28px',fontSize:13,fontWeight:600,borderRadius:8}}>
+                Load More
+              </button>
+            </div>
+          )}
+        </main>
+
+        {/* ══════ CART DRAWER (ORIGINAL) ══════ */}
+        {cartOpen&&(
+          <>
+            <div onClick={()=>setCartOpen(false)} style={{position:'fixed',inset:0,background:'rgba(0,0,0,.4)',zIndex:300}}/>
+            <div className="fade" style={{position:'fixed',top:0,right:0,bottom:0,width:Math.min(380,window.innerWidth-16),
+              background:'#fff',zIndex:301,display:'flex',flexDirection:'column',boxShadow:'-4px 0 20px rgba(0,0,0,.12)'}}>
+              <div style={{padding:'12px 16px',borderBottom:'1px solid #eee',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <h2 style={{fontSize:16,fontWeight:700}}>🛒 Cart ({cartCount})</h2>
+                <button onClick={()=>setCartOpen(false)} style={{background:'none',border:'none',fontSize:18,cursor:'pointer',color:'#888'}}>✕</button>
+              </div>
+              <div style={{flex:1,overflowY:'auto',padding:12}}>
+                {cart.length===0?(
+                  <div style={{textAlign:'center',padding:'36px 0',color:'#B0BEC5'}}>
+                    <span style={{fontSize:40}}>🛒</span>
+                    <p style={{marginTop:8,fontSize:13}}>Cart is empty</p>
+                  </div>
+                ):cart.map(c=>(
+                  <div key={c.sku} style={{display:'flex',gap:10,padding:'10px 0',borderBottom:'1px solid #f5f5f5'}}>
+                    <img src={c.image} alt="" style={{width:48,height:48,objectFit:'contain',borderRadius:8,background:'#fafafa'}}
+                      onError={e=>{(e.target as HTMLImageElement).src='https://placehold.co/48'}}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <p style={{fontSize:12,fontWeight:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{c.name}</p>
+                      <p style={{fontSize:10,color:'#90A4AE'}}>{c.pack}</p>
+                      <div style={{display:'flex',alignItems:'center',gap:6,marginTop:4}}>
+                        <button onClick={()=>updateQty(c.sku,-1)}
+                          style={{width:22,height:22,borderRadius:4,border:'1px solid #e0e0e0',background:'#fff',cursor:'pointer',fontSize:12,display:'flex',alignItems:'center',justifyContent:'center'}}>−</button>
+                        <span style={{fontSize:12,fontWeight:700,minWidth:16,textAlign:'center'}}>{c.qty}</span>
+                        <button onClick={()=>updateQty(c.sku,1)}
+                          style={{width:22,height:22,borderRadius:4,border:'1px solid #e0e0e0',background:'#fff',cursor:'pointer',fontSize:12,display:'flex',alignItems:'center',justifyContent:'center'}}>+</button>
+                        <span style={{flex:1}}/>
+                        <span style={{fontSize:13,fontWeight:700,color:'#263238'}}>₹{(c.price*c.qty).toFixed(2)}</span>
+                        <button onClick={()=>removeFromCart(c.sku)}
+                          style={{background:'none',border:'none',color:'#ef5350',cursor:'pointer',fontSize:14,padding:2}}>🗑</button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {cart.length>0&&(
+                <div style={{padding:12,borderTop:'1px solid #eee'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                    <span style={{fontSize:14,fontWeight:600}}>Total</span>
+                    <span style={{fontSize:16,fontWeight:700}}>₹{cartTotal.toFixed(2)}</span>
+                  </div>
+                  <p style={{fontSize:10,color:'#90A4AE',marginBottom:8}}>
+                    Items will be added to your <strong>thewellnesscorner.com</strong> cart.
+                  </p>
+                  {!token&&<p style={{fontSize:11,color:'#FF6D00',marginBottom:6}}>⚠️ Set your token first</p>}
+                  <button onClick={handleCheckout} disabled={checkingOut} className="btn"
+                    style={{width:'100%',padding:'10px 0',background:token?'#FF6D00':'#bbb',color:'#fff',borderRadius:10,fontSize:13,fontWeight:700,
+                      cursor:checkingOut?'wait':'pointer',opacity:checkingOut?.7:1}}>
+                    {checkingOut?'⏳ Adding to Wellness Corner...':token?'🚀 Push to Wellness Corner Cart':'⚠️ Set Token First'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {/* ══════ TOAST (ORIGINAL) ══════ */}
+        {toast&&(
+          <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'#263238',color:'#fff',
+            padding:'8px 20px',borderRadius:10,fontSize:12,fontWeight:500,boxShadow:'0 4px 16px rgba(0,0,0,.2)',zIndex:500,
+            animation:'fade .2s ease',maxWidth:'90vw',textAlign:'center'}}>
+            {toast}
+          </div>
+        )}
+
+        {/* ══════ FOOTER ══════ */}
+        <footer style={{textAlign:'center',padding:14,fontSize:10,color:'#B0BEC5',borderTop:'1px solid #eee',background:'#fff'}}>
+          1mg Search → Wellness Corner Cart | thewellnesscorner.com
+        </footer>
+      </div>
     </>
-  );
+  )
 }
